@@ -1,0 +1,118 @@
+"""
+=====================================================================
+ stage2_tdl/cnn_lstm/train_cnn_lstm_tdl.py — CNN-LSTM Stage II
+=====================================================================
+ CNN-LSTM (Algorithm 1) retrained on 3GPP TR 38.901 TDL channels
+ for fair Stage II comparison. Same architecture as Stage I
+ (two-layer ConvLSTM 16 -> 8, momentum SGD, fixed SNR = 10 dB)
+ but trained on random TDL scenarios instead of Jakes.
+
+ Usage:
+   python train_cnn_lstm_tdl.py --array 128
+   python train_cnn_lstm_tdl.py --array 64
+
+ Outputs: ../../models/cnn_lstm_tdl_<array>.keras
+=====================================================================
+"""
+
+import os, sys, argparse, time, pickle
+import numpy as np
+import tensorflow as tf
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__),
+                                  '..', '..'))
+from shared.channels import gen_tdl_random, TIME_STEPS
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+
+# ─── Config ───────────────────────────────────────────────────
+EPOCHS       = 25
+STEPS_EPOCH  = 50
+BATCH_SIZE   = 8
+LEARNING_RT0 = 0.001
+MOMENTUM     = 0.9
+TRAIN_SNR_DB = 10.0
+
+
+def build_cnn_lstm(Nr, Nt):
+    """Two-layer ConvLSTM, 16 -> 8 filters (same as Stage I)."""
+    inp = tf.keras.Input(shape=(TIME_STEPS, Nr, Nt, 2))
+    x   = tf.keras.layers.ConvLSTM2D(
+              16, (3,3), padding='same', return_sequences=True,
+              activation='relu')(inp)
+    x   = tf.keras.layers.BatchNormalization()(x)
+    x   = tf.keras.layers.ConvLSTM2D(
+              8, (3,3), padding='same', return_sequences=False,
+              activation='relu')(x)
+    x   = tf.keras.layers.BatchNormalization()(x)
+    out = tf.keras.layers.Conv2D(2, (3,3), padding='same',
+                                  activation='linear')(x)
+    m   = tf.keras.Model(inp, out)
+    m.compile(optimizer=tf.keras.optimizers.SGD(LEARNING_RT0,
+                                                  MOMENTUM),
+              loss='mse', metrics=['mae'])
+    return m
+
+
+def make_dataset(Nr, Nt):
+    """Random-TDL training stream at fixed SNR = 10 dB."""
+    ns = np.sqrt(10**(-TRAIN_SNR_DB/10))
+    def _gen():
+        while True:
+            X, Y = [], []
+            for _ in range(BATCH_SIZE):
+                h = gen_tdl_random(Nr, Nt)
+                hn = (h + np.random.normal(0, ns, h.shape)).astype(np.float32)
+                X.append(hn); Y.append(h[-1])
+            yield np.array(X, dtype=np.float32), \
+                  np.array(Y, dtype=np.float32)
+    return tf.data.Dataset.from_generator(
+        _gen,
+        output_signature=(
+            tf.TensorSpec((BATCH_SIZE, TIME_STEPS, Nr, Nt, 2), tf.float32),
+            tf.TensorSpec((BATCH_SIZE, Nr, Nt, 2),             tf.float32),
+        )
+    ).prefetch(tf.data.AUTOTUNE)
+
+
+def lr_schedule(epoch, lr):
+    return float(LEARNING_RT0 * (0.2 ** (epoch // 5)))
+
+
+def main(Nr, Nt):
+    print(f"\n{'='*64}")
+    print(f"  CNN-LSTM Stage II — TDL (10 scenarios), {Nr}x{Nt}")
+    print(f"  Training SNR: fixed {TRAIN_SNR_DB} dB | Epochs: {EPOCHS}")
+    print(f"{'='*64}")
+
+    model = build_cnn_lstm(Nr, Nt)
+    model.summary()
+    print(f"\n  Params: {model.count_params():,}\n")
+
+    ds  = make_dataset(Nr, Nt)
+    cb  = [tf.keras.callbacks.LearningRateScheduler(lr_schedule, verbose=1)]
+    t0  = time.time()
+    his = model.fit(ds, steps_per_epoch=STEPS_EPOCH, epochs=EPOCHS,
+                    callbacks=cb, verbose=1)
+    elapsed = time.time() - t0
+
+    out_dir = os.path.join(os.path.dirname(__file__),
+                            '..', '..', 'models')
+    os.makedirs(out_dir, exist_ok=True)
+    suffix = '128' if Nt == 128 else '64'
+    out_path  = os.path.join(out_dir, f'cnn_lstm_tdl_{suffix}.keras')
+    hist_path = os.path.join(out_dir, f'cnn_lstm_tdl_{suffix}_history.pkl')
+    model.save(out_path)
+    with open(hist_path, 'wb') as f:
+        pickle.dump({'loss': his.history['loss'],
+                      'mae':  his.history['mae']}, f)
+    print(f"\n  Done in {elapsed:.1f}s")
+    print(f"  Model:   {out_path}")
+
+
+if __name__ == '__main__':
+    p = argparse.ArgumentParser()
+    p.add_argument('--array', type=int, default=128, choices=[64, 128])
+    args = p.parse_args()
+    main(args.array, args.array)
